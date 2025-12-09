@@ -1,5 +1,6 @@
 import json
 import os
+import multiprocessing
 from miditok import REMI, TokenizerConfig
 from collections import Counter
 from tqdm import tqdm
@@ -34,6 +35,15 @@ TOKENIZER_PATH = os.path.join(CURRENT_DIR, "models", "tokenizer")
 METADATA_KEYS_TO_USE = ["composer", "genre", "period", "form", "difficulty"]
 
 TOP_COMPOSERS = get_top_composers(METADATA_PATH, top_n=50)
+
+
+# hold the data inside each CPU so we don't have to pass it back and forth
+WORKER_METADATA = None
+WORKER_TOKENIZER = None
+def init_worker(metadata_dict, tokenizer):
+    global WORKER_METADATA, WORKER_TOKENIZER
+    WORKER_METADATA = metadata_dict
+    WORKER_TOKENIZER = tokenizer
 
 
 def load_metadata(metadata_path):
@@ -92,38 +102,57 @@ def setup_tokenizer(metadata_dict):
     tokenizer.save_pretrained(TOKENIZER_PATH)
 
 
+def process_batch(file_paths_batch):
+    
+    tokenized_batch = []
+
+    for file_path in file_paths_batch:
+        filename = os.path.basename(file_path)
+        # filename format is "<file_id>_<segment_number>"
+        file_id = filename.split('_')[0]
+
+        if file_id not in WORKER_METADATA:
+            return None
+
+        meta_file_tokens = WORKER_METADATA[file_id]
+        meta_file_tokens_ids = [WORKER_TOKENIZER[token] for token in meta_file_tokens]
+
+        tokenized_midi = WORKER_TOKENIZER(file_path)
+        full_tokenized_file = [WORKER_TOKENIZER["BOS_None"]] + meta_file_tokens_ids + tokenized_midi + [WORKER_TOKENIZER["EOS_None"]]
+
+        tokenized_batch.append(full_tokenized_file)
+
+    return tokenized_batch
+
+
 def tokenize_dataset(data_path, metadata_dict, tokenizer):
+
+    file_paths = []
+
+    for root, dirs, files in os.walk(data_path):
+        for filename in files:
+
+            file_path = os.path.join(root, filename)
+            file_paths.append(file_path)
+
+    total_files = len(file_paths)
+
+    BATCH_SIZE = 1000
+    batches = [file_paths[i : i+BATCH_SIZE] for i in range(0, total_files, BATCH_SIZE)]
+
     tokenized_dataset = []
 
-    # for tqdm pbar
-    file_count = sum(len(files) for _,_,files in os.walk(data_path))
+    with multiprocessing.Pool(processes=os.cpu_count(), initializer=init_worker, initargs=(metadata_dict, tokenizer)) as pool:
 
-    with tqdm(total=file_count) as pbar:
-        for root, dirs, files in os.walk(data_path):
-            for filename in files:
-                pbar.update()
+        iterator = pool.imap_unordered(process_batch, batches)
 
-                # filename format is "<file_id>_<segment_number>"
-                file_id = filename.split('_')[0]
-
-                # some files have no metadata, we exclude them
-                if file_id not in metadata_dict:
-                    continue
-
-                meta_file_tokens = metadata_dict[file_id]
-                meta_file_tokens_ids = [tokenizer[token] for token in meta_file_tokens]
-
-                file_path = os.path.join(root, filename)
-
-                tokenized_midi = tokenizer(file_path)
-
-                full_tokenized_file = [tokenizer["BOS_None"]] + meta_file_tokens_ids + tokenized_midi + [tokenizer["EOS_None"]]
-
-                tokenized_dataset.append(full_tokenized_file)
+        with tqdm(total=total_files, desc="Tokenizing", unit="file") as pbar:
+            for tokenized_batch in iterator:
+                if tokenized_batch is not None:
+                    tokenized_dataset.extend(tokenized_batch)
+                pbar.update(BATCH_SIZE)
 
     return tokenized_dataset
-
-
 
 
 if __name__ == "__main__":
